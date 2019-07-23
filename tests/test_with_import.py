@@ -1,0 +1,2 @@
+from with_import_1 import test_type_extension_visible
+from with_import_2 import test_type_extension_visible_again
