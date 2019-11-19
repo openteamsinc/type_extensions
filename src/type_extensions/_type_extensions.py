@@ -13,6 +13,10 @@ import pkgutil
 import sys
 
 
+def is_not_candidate_frame_name(name, not_calling_frame):
+    return name is __name__ or name in not_calling_frame
+
+
 def get_calling_frame_as_import():
     candidate_frame = currentframe()
     while not candidate_frame.f_globals["__name__"].startswith("importlib._bootstrap"):
@@ -25,14 +29,17 @@ def get_calling_frame_as_import():
     return candidate_frame
 
 
-def get_calling_frame():
+def get_calling_frame(not_calling_frame=[]):
     candidate_frame = currentframe()
-    while candidate_frame.f_globals["__name__"] is __name__:
+    while is_not_candidate_frame_name(candidate_frame.f_globals["__name__"],
+            not_calling_frame):
         candidate_frame = candidate_frame.f_back
     return candidate_frame
 
 
 def first_parm_of(f, except_if_none=None):
+    if isinstance(f, property):
+        f = f.fget
     sig = signature(f)
     first_parm = next(iter(sig.parameters.values()))
     if first_parm is None and except_if_none is not None:
@@ -40,26 +47,41 @@ def first_parm_of(f, except_if_none=None):
     return first_parm
 
 
-@dataclass
 class Extension:
-    f: FunctionType
+
+    def __init__(self, f: FunctionType, f_resolved: FunctionType = None):
+        self.f = f
+        self.f_resolved = f_resolved
+
+    def __call__(self, *arg, **kwarg):
+        return self.resolved(*arg, **kwarg)
+
+    @property
+    def resolved(self):
+        if self.f_resolved == None:
+            if isinstance(self.f, property):
+                self.f_resolved = self.f.fget
+            else:
+                self.f_resolved = self.f
+        return self.f_resolved
 
     @property
     def extended_type(self):
-        return self.f.__annotations__.get("self")
+        return self.resolved.__annotations__.get("self")
 
     @property
     def extension_module(self):
-        return self.f.__module__
+        return self.resolved.__module__
 
     @property
     def __name__(self):
-        return self.f.__name__
+        return self.resolved.__name__
 
 
-def extension(f):
+def extension(f, class_method=True, not_calling_frame=[]):
     """
     Transform a function into a type extension
+    #FIXME figure out how to properly handle class vs instance attrs...
     """
     self_parm = first_parm_of(
         f, "A function with no parameters can't be used as a type extension"
@@ -72,13 +94,30 @@ def extension(f):
     calling_frame = get_calling_frame_as_import()
     if calling_frame is None:
         # If called from a notebook, looks like a getattr!
-        calling_frame = get_calling_frame()
+        calling_frame = get_calling_frame(not_calling_frame)
     calling_module = calling_frame.f_globals["__name__"]
     if ExtendableType not in target_type.__bases__:
         target_type = replace_with_extendable_type(target_type, calling_module)
     f = Extension(f)
     target_type.__scoped_setattr__(calling_module, f.__name__, f)
     return f
+
+
+def extension_property(f):
+    return extension(property(f))
+
+
+def class_extension(f):
+    """
+    Transform a function into a class extension. This is the same as a type
+    extension, however, it adds the function as a class method rather than
+    an instance method.
+    """
+    return extension(f, class_method=True)
+
+
+def class_extension_property(f):
+    return extension(property(f), class_method=True)
 
 
 def mextension(f):
@@ -146,8 +185,8 @@ class ExtendableType:
         if resolved_attr is None or not self.match_attr_instance(resolved_attr):
             resolved_attr = getattr(calling_module, attr, None)
         if not self.match_attr_instance(resolved_attr):
-            # Otherwise, look to see if there is a match in any of the known type extension modules that
-            # are also imported by the calling frame
+            # Otherwise, look to see if there is a match in any of the known type
+            # extension modules that are also imported by the calling frame
             for module in self._attrs_to_modules.get(attr, ()):
                 resolved_module = getattr(calling_module, module, None)
                 if resolved_module is not None:
@@ -181,9 +220,11 @@ class ExtendableType:
         if resolved_attr is None:
             raise AttributeError()
         if isinstance(resolved_attr.f, FunctionType):
-            resolved_attr = MethodType(resolved_attr.f, self)
+            resolved_attr = MethodType(resolved_attr, self)
+        elif isinstance(resolved_attr.f, property):
+            return resolved_attr.f.fget(self)
         else:
-            raise Error(f"Attribute wasn't a FunctionType, not supported! {attr}")
+            raise Exception(f"Attribute wasn't a FunctionType, not supported! {attr}")
         return resolved_attr
 
     @classmethod
