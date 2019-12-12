@@ -2,14 +2,16 @@
 type_extensions
 ===============
 
-
-Add a short description here!
+Importable mixin methods for Python.
 
 
 Description
 ===========
 
-A longer description of your project goes here...
+The ``type_extensions`` package defines decorators that make it possible to define typed
+extension methods outside the original class definition in a separate module. The
+methods defined by a ``type_extension`` module may be imported and used in other modules
+without polluting the the original class definition for other modules.
 
 
 Note
