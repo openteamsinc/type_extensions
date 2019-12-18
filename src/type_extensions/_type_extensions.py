@@ -88,7 +88,8 @@ def extension(f, class_method=True, not_calling_frame=[]):
     )
     if self_parm.annotation is Parameter.empty:
         raise Exception(
-            "A type extension function must include a type annotation for the first parameter"
+            "A type extension function must include a type annotation for the first "
+            "parameter"
         )
     target_type = self_parm.annotation
     calling_frame = get_calling_frame_as_import()
@@ -96,8 +97,8 @@ def extension(f, class_method=True, not_calling_frame=[]):
         # If called from a notebook, looks like a getattr!
         calling_frame = get_calling_frame(not_calling_frame)
     calling_module = calling_frame.f_globals["__name__"]
-    if ExtendableType not in target_type.__bases__:
-        target_type = replace_with_extendable_type(target_type, calling_module)
+    if not hasattr(target_type, "__scoped_setattr__"):
+        monkeypatch_extended_type(target_type)
     f = Extension(f)
     target_type.__scoped_setattr__(calling_module, f.__name__, f)
     return f
@@ -165,93 +166,84 @@ class NameGenerator:
         yield f"{self.base_name}_{self.suffix}"
 
 
-class ExtendableType:
-    _scoped_attrs = ModuleScopingDict()
-    _attrs_to_modules = dict()
-    _methods_by_fullname = dict()
+def _match_attr_instance(self, attr_instance):
+    return (
+        attr_instance is not None
+        and isinstance(attr_instance, Extension)
+        and isinstance(self, attr_instance.extended_type)
+    )
 
-    def match_attr_instance(self, attr_instance):
-        return (
-            attr_instance is not None
-            and isinstance(attr_instance, Extension)
-            and isinstance(self, attr_instance.extended_type)
-        )
 
-    def find_attr_in_calling_globals(self, attr, calling_frame, calling_module_name):
-        resolved_attr = None
-        # First, let's see if the name is defined in the module
-        calling_module = import_module(calling_module_name)
-        resolved_attr = calling_frame.f_globals.get(attr, None)
-        if resolved_attr is None or not self.match_attr_instance(resolved_attr):
-            resolved_attr = getattr(calling_module, attr, None)
-        if not self.match_attr_instance(resolved_attr):
-            # Otherwise, look to see if there is a match in any of the known type
-            # extension modules that are also imported by the calling frame
-            for module in self._attrs_to_modules.get(attr, ()):
-                resolved_module = getattr(calling_module, module, None)
-                if resolved_module is not None:
-                    resolved_attr = getattr(resolved_module, attr, None)
-                    if self.match_attr_instance(resolved_attr):
-                        break
-                    else:
-                        resolved_attr = None
+def _find_attr_in_calling_globals(self, attr, calling_frame, calling_module_name):
+    resolved_attr = None
+    # First, let's see if the name is defined in the module
+    calling_module = import_module(calling_module_name)
+    resolved_attr = calling_frame.f_globals.get(attr, None)
+    if resolved_attr is None or not self._match_attr_instance(resolved_attr):
+        resolved_attr = getattr(calling_module, attr, None)
+    if not self._match_attr_instance(resolved_attr):
+        # Otherwise, look to see if there is a match in any of the known type
+        # extension modules that are also imported by the calling frame
+        for module in self._attrs_to_modules.get(attr, ()):
+            resolved_module = getattr(calling_module, module, None)
+            if resolved_module is not None:
+                resolved_attr = getattr(resolved_module, attr, None)
+                if self._match_attr_instance(resolved_attr):
+                    break
                 else:
                     resolved_attr = None
-        if resolved_attr is not None:
-            self.__scoped_setattr__(module, attr, resolved_attr)
-        return resolved_attr
-
-    def __getattr__(self, attr):
-        calling_frame = get_calling_frame()
-        module = calling_frame.f_globals["__name__"]
-        resolved_attr = None
-        if module in self._scoped_attrs and attr in self._scoped_attrs[module]:
-            resolved_attr = self._scoped_attrs[module][attr]
-            if not self.match_attr_instance(resolved_attr):
+            else:
                 resolved_attr = None
-        if (
-            resolved_attr is None
-            and module not in self._scoped_attrs
-            and attr in self._attrs_to_modules
-        ):
-            resolved_attr = self.find_attr_in_calling_globals(
-                attr, calling_frame, module
-            )
-        if resolved_attr is None:
-            raise AttributeError()
-        if isinstance(resolved_attr.f, FunctionType):
-            resolved_attr = MethodType(resolved_attr, self)
-        elif isinstance(resolved_attr.f, property):
-            return resolved_attr.f.fget(self)
-        else:
-            raise Exception(f"Attribute wasn't a FunctionType, not supported! {attr}")
-        return resolved_attr
-
-    @classmethod
-    def __scoped_setattr__(cls, module, attr, value):
-        cls._scoped_attrs.scoped_setitem(module, attr, value)
-        source_modules = cls._attrs_to_modules.setdefault(attr, set())
-        source_modules.add(value.extension_module)
+    if resolved_attr is not None:
+        self.__scoped_setattr__(module, attr, resolved_attr)
+    return resolved_attr
 
 
-def replace_with_extendable_type(target_type, calling_module):
-    # generate a safe name for the replacement type
-    generate_name = NameGenerator(target_type.__name__)()
-    classname = next(generate_name)
-    while hasattr(target_type.__module__, classname):
-        classname = generate_name()
-    scoping_dict = ModuleScopingDict()
-    extendable_type = type(classname, (ExtendableType, target_type), dict())
-    # replace the target_type with the new extendable_type in the originating module
-    # FIXME could we just add the ExtendableType as ... metaclass? or something?
-    target_module = import_module(target_type.__module__)
-    setattr(target_module, target_type.__name__, extendable_type)
-    # replace the target_type with the new extendable type in the calling module, too, if
-    # needed
-    target_module = import_module(calling_module)
+def patch_for__getattr__(self, attr, original_get_attr):
+    if original_get_attr is not None and attr not in self._attrs_to_modules:
+        resolved_attr = original_get_attr(self, attr)
+    calling_frame = get_calling_frame(not_calling_frame=[__name__])
+    module = calling_frame.f_globals["__name__"]
+    resolved_attr = None
+    if module in self._scoped_attrs and attr in self._scoped_attrs[module]:
+        resolved_attr = self._scoped_attrs[module][attr]
+        if not self._match_attr_instance(resolved_attr):
+            resolved_attr = None
     if (
-        hasattr(target_module, target_type.__name__)
-        and getattr(target_module, target_type.__name__) is target_type
+        resolved_attr is None
+        and module not in self._scoped_attrs
+        and attr in self._attrs_to_modules
     ):
-        setattr(target_module, target_type.__name__, extendable_type)
-    return extendable_type
+        resolved_attr = self._find_attr_in_calling_globals(
+            attr, calling_frame, module
+        )
+    if resolved_attr is None:
+        raise AttributeError()
+    if isinstance(resolved_attr.f, property):
+        return resolved_attr.f.fget(self)
+    elif callable(resolved_attr.f): #isinstance(resolved_attr.f, FunctionType):
+        resolved_attr = MethodType(resolved_attr, self)
+    else:
+        raise Exception(f"Attribute wasn't a FunctionType, not supported! {attr}")
+    return resolved_attr
+
+
+@classmethod
+def __scoped_setattr__(cls, module, attr, value):
+    cls._scoped_attrs.scoped_setitem(module, attr, value)
+    source_modules = cls._attrs_to_modules.setdefault(attr, set())
+    source_modules.add(value.extension_module)
+
+
+def monkeypatch_extended_type(target_type):
+    setattr(target_type, "_scoped_attrs", ModuleScopingDict())
+    setattr(target_type, "_attrs_to_modules", dict())
+    setattr(target_type, "_methods_by_fullname", dict())
+    setattr(target_type, "_match_attr_instance", _match_attr_instance)
+    setattr(target_type, "_find_attr_in_calling_globals", _find_attr_in_calling_globals)
+    orig_getattr = getattr(target_type, "__getattr__", None)
+    setattr(
+        target_type,
+        "__getattr__",
+        lambda self, attr: patch_for__getattr__(self, attr, orig_getattr))
+    setattr(target_type, "__scoped_setattr__", __scoped_setattr__)
