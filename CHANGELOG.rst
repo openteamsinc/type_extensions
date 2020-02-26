@@ -4,6 +4,11 @@ type_extensions Change Log
 
 .. current developments
 
+v0.1.2
+====================
+
+
+
 v0.1.1
 ====================
 
