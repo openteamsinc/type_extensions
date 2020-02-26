@@ -9,6 +9,7 @@ from pathlib import Path
 from types import FunctionType, MethodType
 import functools
 import inspect
+import logging
 import pkgutil
 import sys
 
@@ -181,6 +182,7 @@ def _find_attr_in_calling_globals(self, attr, calling_frame, calling_module_name
     resolved_attr = calling_frame.f_globals.get(attr, None)
     if resolved_attr is None or not self._match_attr_instance(resolved_attr):
         resolved_attr = getattr(calling_module, attr, None)
+    module = None
     if not self._match_attr_instance(resolved_attr):
         # Otherwise, look to see if there is a match in any of the known type
         # extension modules that are also imported by the calling frame
@@ -194,7 +196,7 @@ def _find_attr_in_calling_globals(self, attr, calling_frame, calling_module_name
                     resolved_attr = None
             else:
                 resolved_attr = None
-    if resolved_attr is not None:
+    if resolved_attr is not None and module is not None:
         self.__scoped_setattr__(module, attr, resolved_attr)
     return resolved_attr
 
@@ -202,10 +204,12 @@ def _find_attr_in_calling_globals(self, attr, calling_frame, calling_module_name
 def patch_for__getattr__(self, attr, original_get_attr):
     if original_get_attr is not None and attr not in self._attrs_to_modules:
         resolved_attr = original_get_attr(self, attr)
+    else:
+        resolved_attr = None
     calling_frame = get_calling_frame(not_calling_frame=[__name__])
     module = calling_frame.f_globals["__name__"]
-    resolved_attr = None
-    if module in self._scoped_attrs and attr in self._scoped_attrs[module]:
+    if resolved_attr is None \
+            and module in self._scoped_attrs and attr in self._scoped_attrs[module]:
         resolved_attr = self._scoped_attrs[module][attr]
         if not self._match_attr_instance(resolved_attr):
             resolved_attr = None
@@ -218,7 +222,11 @@ def patch_for__getattr__(self, attr, original_get_attr):
             attr, calling_frame, module
         )
     if resolved_attr is None:
-        raise AttributeError()
+        raise AttributeError(
+            f"The step `{attr}` couldn't be found for the prefix type "
+            f"`{self.__class__.__name__}`. Are you sure you imported the step? Or, is "
+            "this step an extension of some other prefix type?"
+            )
     if isinstance(resolved_attr.f, property):
         return resolved_attr.f.fget(self)
     elif callable(resolved_attr.f): #isinstance(resolved_attr.f, FunctionType):
